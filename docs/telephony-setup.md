@@ -125,4 +125,6 @@ Current coverage includes:
 - LiveKit dashboard → Telephony → Calls shows SIP status codes; use it to trace authentication failures or INVITE header issues.
 - Nehos must whitelist LiveKit Cloud IPs and accept the caller ID you present; coordinate with their support to finalise the trunk.
 
-With these steps in place, the agent can dial outbound via Nehos, attach account-code metadata, and initiate SIP transfers. Adjust the metadata payload or environment variables as your workflow evolves.
+## 10. n8n integration
+
+See `docs/n8n-integration.md` for a dedicated guide covering the FastAPI dispatch bridge, expected payloads, response data, and security recommendations (including using Mikrotik firewall rules).

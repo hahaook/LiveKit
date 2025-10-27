@@ -6,6 +6,7 @@ import pytest
 from livekit.agents import AgentSession, inference, llm
 
 from agent import Assistant, _transfer_target_uri, initiate_outbound_call
+from dispatch_api import _compose_metadata, DispatchRequest
 
 
 def _llm() -> llm.LLM:
@@ -97,6 +98,22 @@ def test_transfer_target_uri_formats_tel() -> None:
     assert _transfer_target_uri("+61402012298") == "tel:+61402012298"
     assert _transfer_target_uri("sip:alice@example.com") == "sip:alice@example.com"
     assert _transfer_target_uri("tel:+123") == "tel:+123"
+
+
+def test_compose_metadata_merges_fields() -> None:
+    payload = DispatchRequest(
+        destination="61402",
+        account_code="acct",
+        caller_id="caller",
+        caller_number="+61400",
+        metadata={"extra": "value"},
+    )
+    data = _compose_metadata(payload)
+    assert data["destination"] == "61402"
+    assert data["account_code"] == "acct"
+    assert data["caller_id"] == "caller"
+    assert data["caller_number"] == "+61400"
+    assert data["extra"] == "value"
 
 
 @pytest.mark.asyncio
