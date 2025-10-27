@@ -1,7 +1,11 @@
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
 import pytest
 from livekit.agents import AgentSession, inference, llm
 
-from agent import Assistant
+from agent import Assistant, _transfer_target_uri, initiate_outbound_call
 
 
 def _llm() -> llm.LLM:
@@ -38,6 +42,61 @@ async def test_offers_assistance() -> None:
 
         # Ensures there are no function calls or other unexpected events
         result.expect.no_more_events()
+
+
+@pytest.mark.asyncio
+async def test_initiate_outbound_call_sends_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    destination = "+61123456789"
+    account_code = "NEHOS123"
+    transfer_target = "+61111222333"
+    monkeypatch.setenv("SIP_TRUNK_ID", "ST_test")
+    monkeypatch.delenv("SIP_FROM_IDENTITY", raising=False)
+    monkeypatch.delenv("DEFAULT_CALLER_ID", raising=False)
+
+    create_mock: AsyncMock = AsyncMock()
+    ctx = SimpleNamespace(
+        room=SimpleNamespace(name="outbound-room"),
+        api=SimpleNamespace(sip=SimpleNamespace(create_sip_participant=create_mock)),
+        shutdown=Mock(),
+    )
+
+    call_context = {
+        "destination": destination,
+        "account_code": account_code,
+        "transfer_target": transfer_target,
+    }
+
+    await initiate_outbound_call(ctx, call_context)
+
+    create_mock.assert_awaited_once()
+    request = create_mock.await_args.args[0]
+    assert request.sip_trunk_id == "ST_test"
+    assert request.sip_call_to == destination
+    assert request.sip_number == ""
+    assert request.participant_identity == destination
+    assert request.wait_until_answered is True
+    assert dict(request.headers) == {"X-Account-Code": account_code}
+
+    request_metadata = json.loads(request.participant_metadata)
+    assert request_metadata == {
+        "destination": destination,
+        "account_code": account_code,
+        "transfer_target": transfer_target,
+        "from_identity": destination,
+        "caller_number": None,
+        "caller_name": None,
+        "caller_id": None,
+    }
+
+    assert call_context["sip_participant_identity"] == destination
+    ctx.shutdown.assert_not_called()
+
+
+def test_transfer_target_uri_formats_tel() -> None:
+    assert _transfer_target_uri("61402012298") == "tel:+61402012298"
+    assert _transfer_target_uri("+61402012298") == "tel:+61402012298"
+    assert _transfer_target_uri("sip:alice@example.com") == "sip:alice@example.com"
+    assert _transfer_target_uri("tel:+123") == "tel:+123"
 
 
 @pytest.mark.asyncio
