@@ -67,6 +67,9 @@ Optional telemetry & workflow integrations:
 - `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` to forward OpenTelemetry traces to Langfuse.
 - `N8N_WEBHOOK_URL` to receive an end-of-call JSON report with usage metrics and collected session events.
 - `DEFAULT_LLM_MODEL`, `DEFAULT_STT_MODEL`, and `CARTESIA_MODEL` to tweak the default session models when n8n does not override them.
+- `VOICEMAIL_SILENCE_TIMEOUT` (seconds) to adjust how long the agent waits for a human response before auto-hanging up on suspected voicemail.
+- `MAX_CALL_DURATION_SECONDS`, `CALL_DURATION_OVERRIDE_URL`, and `CALL_DURATION_OVERRIDE_POLL_SECONDS` to enforce automatic hangups for runaway calls (details below).
+- `EGRESS_ENDPOINT`, `EGRESS_BUCKET`, `EGRESS_ACCESS_KEY`, `EGRESS_SECRET_KEY`, optional `EGRESS_REGION`, `EGRESS_PATH_PREFIX`, `EGRESS_FORCE_PATH_STYLE`, and `EGRESS_ROOM_PREFIX` (e.g. `N101222`) to control recording uploads and filename prefixes.
 
 You can load the LiveKit environment automatically using the [LiveKit CLI](https://docs.livekit.io/home/cli/cli-setup):
 
@@ -124,6 +127,60 @@ This project includes a complete suite of evals, based on the LiveKit Agents [te
 ```console
 uv run pytest
 ```
+
+## Call duration watchdog & n8n overrides
+
+Outbound SIP runs can occasionally stall if the PSTN leg drops without a clean BYE. The agent now includes a watchdog that hangs up automatically when a soft limit is hit.
+
+- Set `MAX_CALL_DURATION_SECONDS` (defaults to 120) to establish the base timeout.
+- Optional per-job overrides can be supplied in the dispatch metadata as `max_call_duration_seconds`.
+- To tune the timeout dynamically, expose an HTTP endpoint (for example with n8n) and point `CALL_DURATION_OVERRIDE_URL` at it. The watcher polls this endpoint every `CALL_DURATION_OVERRIDE_POLL_SECONDS` (default 30s) and updates its deadline if the response changes.
+
+The override endpoint must return JSON with one of the following keys. Values must be whole seconds (>=0); returning `0` or a negative value disables the watchdog entirely.
+
+```json
+{
+  "max_duration_seconds": 300
+}
+```
+
+Recognised field names:
+
+- `max_duration_seconds`
+- `max_call_duration_seconds`
+- `maxDurationSeconds`
+- `maxCallDurationSeconds`
+
+### Example n8n flow
+
+1. **HTTP Request node** (method GET)  
+   - Path: `/livekit/call-limit`
+   - Authentication as desired.
+2. **Function node** (optional)  
+   - Use previous call context (e.g. via `/metrics` webhook or an n8n data store) to decide on a limit:
+
+   ```javascript
+   // items[0].json contains whatever state you track
+   const defaultLimit = 120; // seconds
+   const vipNumber = '61402012298';
+
+   const outboundNumber = $json.destination ?? null;
+   const limit = outboundNumber === vipNumber ? 0 : defaultLimit;
+
+   return [{ json: { max_duration_seconds: limit } }];
+   ```
+
+3. **Respond to Webhook node**  
+   - Return the JSON body produced by the Function node. n8n will emit it back to the agent.
+
+With that pipeline in place the agent:
+
+- Starts every call at the configured base limit.
+- Polls the n8n endpoint on the configured interval.
+- Immediately hangs up once the deadline is reached, logging `Maximum call duration reached`.
+- Stops polling if the endpoint returns `0` (disabled) or the call terminates normally.
+
+The override URL is read both from the environment and the job metadata (`session_options.max_call_duration_override_url` or `call_context.max_call_duration_override_url`), so you can control a subset of calls independently while keeping a global default in `.env.local`.
 
 ## Using this template repo for your own project
 

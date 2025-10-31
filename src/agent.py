@@ -1,8 +1,9 @@
+import asyncio
 import base64
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
@@ -16,12 +17,15 @@ from livekit.agents import (
     MetricsCollectedEvent,
     RoomInputOptions,
     RunContext,
+    SpeechCreatedEvent,
+    UserInputTranscribedEvent,
     WorkerOptions,
     cli,
     function_tool,
     get_job_context,
     metrics,
 )
+from livekit.agents.voice.events import ConversationItemAddedEvent
 from livekit.agents.telemetry import set_tracer_provider
 from livekit.plugins import cartesia, noise_cancellation, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
@@ -40,6 +44,66 @@ logging.basicConfig(
 DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL", "openai/gpt-4o-mini")
 DEFAULT_STT_MODEL = os.getenv("DEFAULT_STT_MODEL", "assemblyai/universal-streaming:en")
 DEFAULT_CARTESIA_MODEL = os.getenv("CARTESIA_MODEL", "sonic-2")
+VOICEMAIL_KEYWORDS = [
+    "leave a message",
+    "voice mail system",
+    "voicemail system",
+    "is not available",
+    "please leave your name",
+    "after the tone",
+    "at the tone",
+    "record your message",
+    "record your name",
+    "can't take your call",
+    "unable to take your call",
+    "message bank",
+    "leave your details",
+    "no one is available",
+]
+VOICEMAIL_SILENCE_TIMEOUT = float(os.getenv("VOICEMAIL_SILENCE_TIMEOUT", "8.0"))
+
+
+def _coerce_non_negative_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if number < 0:
+        return None
+    return number
+
+
+def _coerce_positive_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        number = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    return number
+
+
+_ENV_MAX_CALL_DURATION = _coerce_non_negative_int(
+    os.getenv("MAX_CALL_DURATION_SECONDS")
+)
+DEFAULT_MAX_CALL_DURATION_SECONDS = (
+    _ENV_MAX_CALL_DURATION if _ENV_MAX_CALL_DURATION is not None else 120
+)
+
+CALL_DURATION_OVERRIDE_URL_DEFAULT = os.getenv(
+    "CALL_DURATION_OVERRIDE_URL"
+) or os.getenv("N8N_TIMEOUT_OVERRIDE_URL")
+
+_ENV_CALL_DURATION_POLL = _coerce_positive_float(
+    os.getenv("CALL_DURATION_OVERRIDE_POLL_SECONDS")
+)
+CALL_DURATION_OVERRIDE_POLL_SECONDS_DEFAULT = (
+    _ENV_CALL_DURATION_POLL if _ENV_CALL_DURATION_POLL is not None else 30.0
+)
 
 
 def _parse_metadata(raw_metadata: Optional[str]) -> dict[str, Any]:
@@ -110,14 +174,18 @@ def _resolve_caller_identity(call_context: dict[str, Any], fallback: str) -> str
     )
 
 
-async def initiate_outbound_call(ctx: JobContext, call_context: dict[str, Any]) -> None:
+async def initiate_outbound_call(
+    ctx: JobContext, call_context: dict[str, Any]
+) -> Optional[datetime]:
     destination = call_context.get("destination")
     if not destination:
-        return
+        return None
 
     sip_trunk_id = os.getenv("SIP_TRUNK_ID")
     if not sip_trunk_id:
-        logger.error("SIP_TRUNK_ID environment variable is required for outbound SIP calls")
+        logger.error(
+            "SIP_TRUNK_ID environment variable is required for outbound SIP calls"
+        )
         return
 
     participant_identity = _resolve_caller_identity(call_context, fallback=destination)
@@ -141,9 +209,13 @@ async def initiate_outbound_call(ctx: JobContext, call_context: dict[str, Any]) 
 
     destination_fields = _destination_fields(destination)
     if not destination_fields:
-        logger.error("destination did not resolve to a valid SIP target: %s", destination)
+        logger.error(
+            "destination did not resolve to a valid SIP target: %s", destination
+        )
         return
-    logger.debug("dialing destination %s with fields %s", destination, destination_fields)
+    logger.debug(
+        "dialing destination %s with fields %s", destination, destination_fields
+    )
 
     request_args = {
         "room_name": ctx.room.name,
@@ -167,11 +239,15 @@ async def initiate_outbound_call(ctx: JobContext, call_context: dict[str, Any]) 
         await ctx.api.sip.create_sip_participant(
             api.CreateSIPParticipantRequest(**request_args)
         )
+        connected_at = datetime.now(timezone.utc)
+        call_context["call_connected_at"] = connected_at.isoformat()
+        await _start_recording(ctx, call_context, audio_only=True)
         logger.info(
             "outbound SIP call initiated to %s via trunk %s",
             destination,
             sip_trunk_id,
         )
+        return connected_at
     except api.TwirpError as exc:
         logger.error(
             "failed to create SIP participant: %s (SIP %s %s)",
@@ -183,6 +259,7 @@ async def initiate_outbound_call(ctx: JobContext, call_context: dict[str, Any]) 
     except Exception:
         logger.exception("unexpected error creating SIP participant")
         ctx.shutdown()
+    return None
 
 
 def _transfer_target_uri(target: str) -> Optional[str]:
@@ -196,11 +273,164 @@ def _transfer_target_uri(target: str) -> Optional[str]:
     return _format_tel_uri(candidate)
 
 
+async def _hangup_session(
+    session: AgentSession, reason: str, *, strict: bool = False
+) -> None:
+    logger.info("hangup initiated: %s (strict=%s)", reason, strict)
+    job_ctx = get_job_context()
+    if job_ctx is not None:
+        try:
+            await job_ctx.api.room.delete_room(
+                api.DeleteRoomRequest(
+                    room=job_ctx.room.name,
+                )
+            )
+        except Exception:
+            logger.exception("failed to delete room during hangup")
+        try:
+            job_ctx.shutdown()
+        except Exception:
+            logger.exception("failed to shutdown job during hangup")
+    session.shutdown(drain=not strict)
+
+
+async def _start_recording(
+    ctx: JobContext, call_context: dict[str, Any], *, audio_only: bool = True
+) -> None:
+    endpoint = os.getenv("EGRESS_ENDPOINT")
+    bucket = os.getenv("EGRESS_BUCKET")
+    access_key = os.getenv("EGRESS_ACCESS_KEY")
+    secret_key = os.getenv("EGRESS_SECRET_KEY")
+    prefix = os.getenv("EGRESS_PATH_PREFIX", "call-recordings")
+    if not all([endpoint, bucket, access_key, secret_key]):
+        logger.warning(
+            "EGRESS_* environment variables not fully set; skipping recording"
+        )
+        return
+
+    extension = "mp3" if audio_only else "mp4"
+    file_type = api.EncodedFileType.MP3 if audio_only else api.EncodedFileType.MP4
+    room_segment = os.getenv("EGRESS_ROOM_PREFIX") or ctx.room.name
+
+    file_output = api.EncodedFileOutput(
+        file_type=file_type,
+        filepath=f"{prefix}/{room_segment}_${{timestamp}}.{extension}",
+        s3=api.S3Upload(
+            access_key=access_key,
+            secret=secret_key,
+            bucket=bucket,
+            endpoint=endpoint,
+            region=os.getenv("EGRESS_REGION", "us-004"),
+            force_path_style=os.getenv("EGRESS_FORCE_PATH_STYLE", "true").lower()
+            in {"1", "true", "yes", "on"},
+        ),
+    )
+
+    request = api.RoomCompositeEgressRequest(
+        room_name=ctx.room.name,
+        layout="speaker-dark",
+        audio_only=audio_only,
+        file_outputs=[file_output],
+    )
+
+    try:
+        info = await ctx.api.egress.start_room_composite_egress(request)
+    except api.TwirpError as exc:
+        logger.error("failed to start egress: %s", exc.message)
+        return
+    except Exception:
+        logger.exception("unexpected error starting egress")
+        return
+
+    egress_entry = {
+        "egress_id": info.egress_id,
+        "status": getattr(info, "status", None),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "error": getattr(info, "error", None),
+    }
+    call_context["egress"] = egress_entry
+    call_context["egress_id"] = info.egress_id
+    logger.info(
+        "started egress recording %s for room %s (status=%s)",
+        info.egress_id,
+        ctx.room.name,
+        getattr(info, "status", None),
+    )
+
+
 def _get_session_option(call_context: dict[str, Any], key: str) -> Any:
     session_options = call_context.get("session_options")
     if isinstance(session_options, dict) and key in session_options:
         return session_options[key]
     return call_context.get(key)
+
+
+def _resolve_call_duration_config(
+    call_context: dict[str, Any],
+) -> tuple[Optional[int], Optional[str], float]:
+    limit_candidate = _get_session_option(call_context, "max_call_duration_seconds")
+    if limit_candidate is None:
+        limit_candidate = call_context.get("max_call_duration_seconds")
+    max_duration = _coerce_non_negative_int(limit_candidate)
+    if max_duration is None:
+        max_duration = DEFAULT_MAX_CALL_DURATION_SECONDS
+
+    override_url = (
+        _get_session_option(call_context, "max_call_duration_override_url")
+        or _get_session_option(call_context, "call_duration_override_url")
+        or call_context.get("max_call_duration_override_url")
+        or call_context.get("call_duration_override_url")
+        or CALL_DURATION_OVERRIDE_URL_DEFAULT
+    )
+
+    poll_candidate = (
+        _get_session_option(call_context, "max_call_duration_poll_seconds")
+        or _get_session_option(call_context, "call_duration_override_poll_seconds")
+        or call_context.get("max_call_duration_poll_seconds")
+        or call_context.get("call_duration_override_poll_seconds")
+        or CALL_DURATION_OVERRIDE_POLL_SECONDS_DEFAULT
+    )
+    poll_seconds = (
+        _coerce_positive_float(poll_candidate)
+        or CALL_DURATION_OVERRIDE_POLL_SECONDS_DEFAULT
+    )
+
+    return max_duration, override_url, poll_seconds
+
+
+async def _fetch_max_duration_override(url: str) -> Optional[int]:
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(url)
+    except Exception:
+        logger.warning(
+            "failed to fetch call duration override from %s", url, exc_info=True
+        )
+        return None
+
+    try:
+        payload = response.json()
+    except json.JSONDecodeError:
+        logger.warning("call duration override response was not valid JSON")
+        return None
+
+    for key in (
+        "max_duration_seconds",
+        "max_call_duration_seconds",
+        "maxDurationSeconds",
+        "maxCallDurationSeconds",
+    ):
+        if key in payload:
+            override = _coerce_non_negative_int(payload[key])
+            if override is None:
+                logger.warning(
+                    "override value for %s could not be parsed; ignoring", key
+                )
+                return None
+            return override
+
+    logger.debug("call duration override response did not contain a recognized key")
+    return None
 
 
 def _coerce_bool(value: Any, default: bool) -> bool:
@@ -244,14 +474,13 @@ You are "Sarah," a professional and persuasive voice AI sales agent for TM Mobil
 *   **Voice-Optimized Language:** You're interacting with the user over voice, so use natural, conversational language appropriate for your persona. Keep your responses concise. Since this is a voice conversation, you MUST NOT use lists, bullets, emojis, or non-verbal stage directions like *laughs*.
 *   **Data Integrity:** You MUST NEVER invent details about the product or offer that are not listed in the `Product & Offer Knowledge Base` section. All information you provide MUST be from that source.
 *   **Disinterest Protocol:** If a user expresses clear and firm disinterest (e.g., "stop calling me," "take me off your list") and you have already attempted one rebuttal from the `Objection & Query Handling` section, you MUST politely end the call with a phrase like, "I understand. Thank you for your time. Goodbye."
+*   **Speech Continuity:** During delivery of scripted sections (especially the greeting and pitch), you MUST continue speaking even if the user gives short acknowledgments such as "yes", "okay", or "mm-hmm". You only pause if the user clearly interrupts with a question, objection, or disinterest signal.
 
 ### 4. Conversation Flow
 This is the step-by-step process you MUST follow for every call.
 
 **Step 1: Greeting & Initial Pitch**
-1.  Begin the call with the exact phrase: "Hi, my name is Sarah calling from TM Mobile. Hope you're having a good day."
-2.  You MUST then pause for 1-2 seconds to allow for system detection of voicemail or automated messages.
-3.  Immediately after the pause, continue the presentation: "The reason for my call is that our system has selected your number to receive a new smartphone as part of our latest technology rollout. It's a brand new Android dual SIM smartphone with a 6-inch full-screen display and four cameras. As part of a one-month promotion, it's available with a 50% discount, bringing the price down from nearly $800 to just $399."
+1.  Begin the call with the exact phrase: "Hi, my name is Sarah calling from TM Mobile. Hope you're having a good day... The reason for my call is that our system has selected your number to receive a new smartphone as part of our latest technology rollout. It's a brand new Android dual SIM smartphone with a 6-inch full-screen display and four cameras. As part of a one-month promotion, it's available with a 50% discount, bringing the price down from nearly $800 to just $399."
 
 **Step 2: Gauge Interest & Handle Objections**
 1.  After the pitch, transition to gauging interest with a question like, "Does that sound interesting to you?"
@@ -265,6 +494,8 @@ You MUST trigger a transfer ONLY under one of the following conditions:
 *   The user asks a specific question that is not covered in your `Objection & Query Handling` scripts.
 
 When a transfer is required, you MUST respond with: "Of course, I can connect you to my manager right away. Please hold. [tool: transfer_call]"
+
+*   Once the conversation is complete (for example, after saying goodbye or confirming there is nothing else the caller needs), you MUST disconnect by invoking `[tool: hangUp(reason="Call completed", strict=False)]`.
 
 **Step 4: Voicemail & Automated System Handling**
 *   If the system initially detects a voicemail, you MUST trigger a hang-up.
@@ -284,7 +515,7 @@ You MUST use these exact scripts to respond to the following user questions or s
 *   **If the user says "I am in a contract with Telstra/Optus":**
     *   **Response:** "No worries, we are not changing your plan. It's a dual SIM smartphone, so you can still use your same number and same service provider alongside a new one."
 *   **If the user asks about the price or "Am I getting it for free?":**
-    *   **Response:** "That’s a great question. Because your number was selected for our technology rollout, you receive the phone for just $399 instead of the usual market price of up to $800. You can even pay that in easy instalments, with the first payment being just $80 to get it delivered. Does that sound like something you'd be interested in exploring further with my manager?"
+    *   **Response:** "That's a great question. Because your number was selected for our technology rollout, you receive the phone for just $399 instead of the usual market price of up to $800. You can even pay that in easy instalments, with the first payment being just $80 to get it delivered. Does that sound like something you'd be interested in exploring further with my manager?"
 *   **If the user asks a question NOT covered by these scripts:**
     *   **Response:** "I'm sorry, I do not have this information." Then, you MUST immediately initiate a transfer as defined in Step 3 of the `Conversation Flow`.
 
@@ -298,7 +529,7 @@ This is the complete set of facts about the offer. You MUST NOT add or invent in
 *   **Payment Option:** Easy installments, with a first payment of $80.
 *   **Key Features:** 6-inch, full-screen display; Four cameras (two front, two back); Face unlock and fingerprint sensor.
 *   **Capabilities:** Full access to the internet, email, social media (Facebook, Instagram), and the Play Store for games and apps.
-*   **Warranty:** 12-month manufacturer’s warranty.
+*   **Warranty:** 12-month manufacturer's warranty.
 *   **Delivery:** Sent via Australia Post within 5-7 working days after the first installment is paid.
 *   **Return Policy:** The user can inspect the phone upon receipt and return it if there is anything wrong with it.
 
@@ -355,6 +586,11 @@ You MUST verbalize the following types of information as described to ensure cla
         )
         await announcement.wait_for_playout()
 
+        self.call_context["transfer_in_progress"] = True
+        self.call_context["transfer_initiated_at"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+
         try:
             await job_ctx.api.sip.transfer_sip_participant(
                 api.TransferSIPParticipantRequest(
@@ -365,9 +601,20 @@ You MUST verbalize the following types of information as described to ensure cla
             )
         except Exception:
             logger.exception("failed to transfer SIP participant")
+            self.call_context["transfer_in_progress"] = False
             return "I could not transfer the call."
 
         return "Transfer initiated."
+
+    @function_tool(name="hangUp")
+    async def hang_up(
+        self, ctx: RunContext, reason: str = "Call completed", strict: bool = False
+    ) -> str:
+        """Disconnect the call and shut down the session immediately."""
+
+        await _hangup_session(ctx.session, reason, strict=strict)
+        return "Disconnecting now."
+
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
@@ -424,7 +671,9 @@ def setup_langfuse_from_env() -> None:
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
     except ImportError:
-        logger.exception("OpenTelemetry packages are not installed; cannot enable Langfuse")
+        logger.exception(
+            "OpenTelemetry packages are not installed; cannot enable Langfuse"
+        )
         return
 
     langfuse_auth = base64.b64encode(f"{public_key}:{secret_key}".encode()).decode()
@@ -447,6 +696,9 @@ async def send_n8n_report(
     session_start: Optional[datetime],
     session_end: Optional[datetime],
     session_config: dict[str, Any],
+    call_start: Optional[datetime],
+    call_end: Optional[datetime],
+    transcript_log: list[dict[str, Any]],
 ) -> None:
     job_id = getattr(job_ctx.job, "job_id", None) or getattr(job_ctx.job, "id", None)
 
@@ -455,6 +707,12 @@ async def send_n8n_report(
     duration_seconds: Optional[float] = None
     if session_start and session_end:
         duration_seconds = (session_end - session_start).total_seconds()
+
+    call_start_iso = call_start.isoformat() if call_start else None
+    call_end_iso = call_end.isoformat() if call_end else None
+    call_duration_seconds: Optional[float] = None
+    if call_start and call_end:
+        call_duration_seconds = (call_end - call_start).total_seconds()
 
     payload = {
         "room_name": job_ctx.room.name,
@@ -465,7 +723,12 @@ async def send_n8n_report(
         "session_start": start_iso,
         "session_end": end_iso,
         "session_duration_seconds": duration_seconds,
+        "call_start": call_start_iso,
+        "call_end": call_end_iso,
+        "call_duration_seconds": call_duration_seconds,
         "session_config": session_config,
+        "egress": _object_to_dict(call_context.get("egress")),
+        "transcript": transcript_log,
     }
 
     try:
@@ -641,6 +904,180 @@ async def entrypoint(ctx: JobContext):
         preemptive_generation=preemptive_generation,
     )
 
+    conversation_log: list[dict[str, Any]] = []
+
+    voicemail_detected = False
+    human_spoke = False
+    voicemail_timeout_task: asyncio.Task[None] | None = None
+    background_tasks: set[asyncio.Task[None]] = set()
+
+    def _track_task(task: asyncio.Task[None]) -> None:
+        background_tasks.add(task)
+
+        def _cleanup(_task: asyncio.Task[None]) -> None:
+            background_tasks.discard(_task)
+
+        task.add_done_callback(_cleanup)
+
+    async def _trigger_voicemail(reason: str) -> None:
+        nonlocal voicemail_detected, voicemail_timeout_task
+        if voicemail_detected:
+            return
+        voicemail_detected = True
+        call_context["voicemail_detected"] = True
+        call_context["voicemail_reason"] = reason
+        task = voicemail_timeout_task
+        current_task = asyncio.current_task()
+        if task and not task.done() and task is not current_task:
+            task.cancel()
+        await _hangup_session(session, reason, strict=True)
+
+    @session.on("user_input_transcribed")
+    def _on_user_transcribed(ev: UserInputTranscribedEvent) -> None:
+        nonlocal human_spoke
+        if voicemail_detected or not ev.is_final:
+            return
+        transcript = ev.transcript.strip()
+        if not transcript:
+            return
+        conversation_log.append(
+            {
+                "speaker": "user",
+                "text": transcript,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "language": ev.language,
+            }
+        )
+        lower = transcript.lower()
+        if any(keyword in lower for keyword in VOICEMAIL_KEYWORDS):
+            task = asyncio.create_task(
+                _trigger_voicemail("Voicemail keywords detected")
+            )
+            _track_task(task)
+            return
+        human_spoke = True
+
+    @session.on("speech_created")
+    def _on_speech_created(ev: SpeechCreatedEvent) -> None:
+        if voicemail_detected:
+            return
+        # Nothing to capture here; transcripts are collected via conversation_item_added
+
+    async def _monitor_voicemail_timeout() -> None:
+        try:
+            await asyncio.sleep(VOICEMAIL_SILENCE_TIMEOUT)
+        except asyncio.CancelledError:
+            return
+        if not human_spoke and not voicemail_detected:
+            await _trigger_voicemail("No human speech detected during greeting")
+
+    voicemail_timeout_task = asyncio.create_task(_monitor_voicemail_timeout())
+    _track_task(voicemail_timeout_task)
+
+    @session.on("conversation_item_added")
+    def _on_conversation_item_added(ev: ConversationItemAddedEvent) -> None:
+        item = getattr(ev, "item", None)
+        if item is None:
+            return
+        role = getattr(item, "role", None)
+        if role != "assistant":
+            return
+        content = getattr(item, "content", None)
+        text_value = ""
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    text_parts.append(part)
+                else:
+                    text_attr = getattr(part, "text", None)
+                    if text_attr:
+                        text_parts.append(str(text_attr))
+            text_value = " ".join(filter(None, (text.strip() for text in text_parts)))
+        elif isinstance(content, str):
+            text_value = content.strip()
+        else:
+            text_attr = getattr(item, "text", None)
+            if text_attr:
+                text_value = str(text_attr).strip()
+        if not text_value:
+            return
+        conversation_log.append(
+            {
+                "speaker": "assistant",
+                "text": text_value,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
+    async def _monitor_call_duration(
+        initial_limit_seconds: Optional[int],
+        override_url: Optional[str],
+        poll_seconds: float,
+        start_time: datetime,
+    ) -> None:
+        limit_seconds = initial_limit_seconds
+        if limit_seconds is None or limit_seconds <= 0:
+            logger.debug("Call duration monitor disabled (limit=%s)", limit_seconds)
+            return
+
+        poll_seconds = max(poll_seconds, 5.0)
+        deadline = start_time + timedelta(seconds=limit_seconds)
+        logger.info(
+            "Call duration limit set to %s seconds (override_url=%s, poll_interval=%ss)",
+            limit_seconds,
+            override_url or "none",
+            poll_seconds,
+        )
+
+        while True:
+            now = datetime.now(timezone.utc)
+            remaining = (deadline - now).total_seconds()
+            if call_context.get("transfer_in_progress"):
+                logger.info(
+                    "Call duration monitor stopping due to active transfer "
+                    "(limit=%s seconds, elapsed=%.2f)",
+                    limit_seconds,
+                    (now - start_time).total_seconds(),
+                )
+                return
+            if remaining <= 0:
+                logger.warning("Maximum call duration reached; hanging up")
+                await _hangup_session(
+                    session, "Maximum call duration reached", strict=False
+                )
+                break
+
+            sleep_for = min(remaining, poll_seconds)
+            try:
+                await asyncio.sleep(sleep_for)
+            except asyncio.CancelledError:
+                logger.debug("Call duration monitor cancelled")
+                return
+
+            updated_limit = _coerce_non_negative_int(
+                call_context.get("max_call_duration_seconds")
+            )
+
+            if override_url:
+                override_limit = await _fetch_max_duration_override(override_url)
+                if override_limit is not None:
+                    call_context["max_call_duration_seconds"] = override_limit
+                    updated_limit = override_limit
+
+            if updated_limit is None:
+                updated_limit = limit_seconds
+
+            if updated_limit != limit_seconds:
+                limit_seconds = updated_limit
+                if limit_seconds is None or limit_seconds <= 0:
+                    logger.info(
+                        "Call duration limit disabled via override; stopping monitor"
+                    )
+                    return
+                deadline = start_time + timedelta(seconds=limit_seconds)
+                logger.info("Call duration limit updated to %s seconds", limit_seconds)
+
     # To use a realtime model instead of a voice pipeline, use the following session setup instead.
     # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))
     # 1. Install livekit-agents[openai]
@@ -652,6 +1089,7 @@ async def entrypoint(ctx: JobContext):
     # )
 
     session_start_time: Optional[datetime] = None
+    call_connected_at: Optional[datetime] = None
 
     # Metrics collection, to measure pipeline performance
     # For more information, see https://docs.livekit.io/agents/build/metrics/
@@ -670,6 +1108,12 @@ async def entrypoint(ctx: JobContext):
         )
 
     async def finalize_session():
+        if background_tasks:
+            for task in list(background_tasks):
+                task.cancel()
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+            background_tasks.clear()
+
         summary = usage_collector.get_summary()
         logger.info(f"Usage: {summary}")
         session_end_time = datetime.now(timezone.utc)
@@ -677,6 +1121,41 @@ async def entrypoint(ctx: JobContext):
         if not n8n_url:
             logger.debug("N8N_WEBHOOK_URL not configured; skipping end-of-call report")
             return
+
+        egress_entry = call_context.get("egress", {})
+        egress_id = egress_entry.get("egress_id") or call_context.get("egress_id")
+        if egress_id:
+            try:
+                result = await ctx.api.egress.stop_egress(
+                    api.StopEgressRequest(egress_id=egress_id)
+                )
+                egress_entry.update(
+                    {
+                        "stopped_at": datetime.now(timezone.utc).isoformat(),
+                        "status": getattr(result, "status", None),
+                        "error": getattr(result, "error", None),
+                        "duration": getattr(result, "duration", None),
+                        "results": [
+                            _object_to_dict(out)
+                            for out in getattr(result, "outputs", [])
+                        ]
+                        if hasattr(result, "outputs")
+                        else None,
+                    }
+                )
+                call_context["egress"] = egress_entry
+                logger.info(
+                    "stopped egress recording %s (status=%s, error=%s)",
+                    egress_id,
+                    egress_entry.get("status"),
+                    egress_entry.get("error"),
+                )
+            except api.TwirpError as exc:
+                egress_entry["error"] = exc.message
+                call_context["egress"] = egress_entry
+                logger.error("failed to stop egress %s: %s", egress_id, exc.message)
+            except Exception:
+                logger.exception("unexpected error stopping egress")
 
         await send_n8n_report(
             url=n8n_url,
@@ -687,6 +1166,9 @@ async def entrypoint(ctx: JobContext):
             session_start=session_start_time,
             session_end=session_end_time,
             session_config=session_config_applied,
+            call_start=call_connected_at,
+            call_end=session_end_time,
+            transcript_log=list(conversation_log),
         )
 
     ctx.add_shutdown_callback(finalize_session)
@@ -713,7 +1195,31 @@ async def entrypoint(ctx: JobContext):
     # Join the room and connect to the user
     await ctx.connect()
 
-    await initiate_outbound_call(ctx, call_context)
+    initial_limit_seconds, override_url, poll_seconds = _resolve_call_duration_config(
+        call_context
+    )
+    configured_limit = call_context.get("max_call_duration_seconds")
+    if configured_limit is None and initial_limit_seconds is not None:
+        call_context["max_call_duration_seconds"] = initial_limit_seconds
+        configured_limit = initial_limit_seconds
+
+    call_connected_at = await initiate_outbound_call(ctx, call_context)
+    call_start_for_timeout = (
+        call_connected_at or session_start_time or datetime.now(timezone.utc)
+    )
+
+    if configured_limit is not None or initial_limit_seconds is not None:
+        timeout_task = asyncio.create_task(
+            _monitor_call_duration(
+                configured_limit
+                if configured_limit is not None
+                else initial_limit_seconds,
+                override_url,
+                poll_seconds,
+                call_start_for_timeout,
+            )
+        )
+        _track_task(timeout_task)
 
 
 if __name__ == "__main__":

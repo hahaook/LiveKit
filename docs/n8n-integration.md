@@ -78,6 +78,9 @@ Example success response:
     "caller_name": "LiveKit Nehos Hosted",
     "ticket_id": "INC-1234"
   },
+  "call_start": "2025-10-28T06:49:37.733000Z",
+  "call_end": "2025-10-28T06:50:22.105000Z",
+  "call_duration_seconds": 44.372,
   "state": {
     "jobs": [
       {
@@ -94,7 +97,44 @@ Example success response:
 }
 ```
 
-When the call ends, the agent posts an additional webhook to `N8N_WEBHOOK_URL` with a usage summary, per-turn metrics, session start/end timestamps, duration, and the resolved session configuration. Use this payload to drive follow-up automation or analytics inside n8n.
+When the call ends, the agent posts an additional webhook to `N8N_WEBHOOK_URL` with a usage summary, per-turn metrics, session start/end timestamps, the agent session duration, a call-specific start/end/duration window (measured from call connection to hangup), the resolved session configuration, and a `transcript` array containing the user/assistant turns captured during the call. Use this payload to drive follow-up automation or analytics inside n8n.
+
+## 5. Optional call recording
+
+LiveKit does not persist audio automatically. If you want to record select calls, wrap LiveKit Egress behind a flag in your dispatch metadata:
+
+```json
+"record_call": true
+```
+
+Keep the field absent or `false` to skip recording (the default). When it is `true`:
+
+1. Ensure you have an Egress template configured in LiveKit Cloud that points to your preferred storage (S3, GCS, Webhook, etc.) and that your worker’s API key grants `egress:write`.
+2. In `entrypoint`, after parsing `call_context`, check `record_call` and start a Room Composite Egress job:
+
+   ```python
+   from livekit import api
+
+   record = bool(_get_session_option(call_context, "record_call"))
+   if record:
+       req = api.RoomCompositeEgressRequest(
+           room_name=ctx.room.name,
+           layout="speaker-dark",
+           audio_only=True,
+       )
+       info = await ctx.api.egress.start_room_composite(req)
+       call_context["egress_id"] = info.egress_id
+   ```
+
+3. In your shutdown callback, stop the egress if it was started:
+
+   ```python
+   egress_id = call_context.get("egress_id")
+   if egress_id:
+       await ctx.api.egress.stop_egress(api.StopEgressRequest(egress_id=egress_id))
+   ```
+
+This setup keeps recording opt-in per call while reusing n8n to decide which jobs should be captured.
 
 Store these identifiers in n8n if you need to reconcile the LiveKit call later (e.g., writing to a CRM or support ticket).
 
