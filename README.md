@@ -62,6 +62,12 @@ Sign up for [LiveKit Cloud](https://cloud.livekit.io/) then set up the environme
 - `LIVEKIT_API_KEY`
 - `LIVEKIT_API_SECRET`
 
+Optional telemetry & workflow integrations:
+
+- `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` to forward OpenTelemetry traces to Langfuse.
+- `N8N_WEBHOOK_URL` to receive an end-of-call JSON report with usage metrics and collected session events.
+- `DEFAULT_LLM_MODEL`, `DEFAULT_STT_MODEL`, and `CARTESIA_MODEL` to tweak the default session models when n8n does not override them.
+
 You can load the LiveKit environment automatically using the [LiveKit CLI](https://docs.livekit.io/home/cli/cli-setup):
 
 ```bash

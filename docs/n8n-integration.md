@@ -35,6 +35,13 @@ Send a JSON body with the following fields:
   "caller_id": "LiveKitNehosHosted",
   "caller_number": "+61123456789",
   "caller_name": "LiveKit Nehos Hosted",
+  "session_options": {
+    "preemptive_generation": false,
+    "llm": "openai/gpt-4o-mini",
+    "stt": "assemblyai/universal-streaming:en",
+    "tts": "cartesia", 
+    "cartesia_voice": "043cfc81-d69f-4bee-ae1e-7862cb358650"
+  },
   "metadata": {
     "ticket_id": "INC-1234"
   }
@@ -44,7 +51,13 @@ Send a JSON body with the following fields:
 - `destination` and `account_code` are required.
 - `transfer_target` supplies the number the agent should use if it hands off the call.
 - `caller_id` / `caller_number` / `caller_name` override the SIP `From` identity.
+- `session_options` (optional) lets you customise the session per call. You can provide:
+  - `llm`, `stt`, and `tts` to select models (strings or, for TTS, a dict with `provider`/`model`/`voice`).
+  - `cartesia_voice` and `cartesia_model` to adjust the Cartesia plugin voice/model when `tts` is `cartesia`.
+  - `preemptive_generation` (boolean-ish) to enable/disable pre-emptive replies.
 - `metadata` is optional; any keys you include are merged into the dispatch metadata and forwarded to the agent session.
+
+These keys can also be passed at the top level of the dispatch payload if it’s simpler for your workflow.
 
 ## 4. Response payload
 
@@ -64,9 +77,24 @@ Example success response:
     "caller_number": "+61123456789",
     "caller_name": "LiveKit Nehos Hosted",
     "ticket_id": "INC-1234"
+  },
+  "state": {
+    "jobs": [
+      {
+        "id": "AJ_def456",
+        "dispatch_id": "AD_abc123",
+        "room": "outbound-9f1a2b3c4d",
+        "state": {
+          "status": 1,
+          "started_at": "2025-10-28T06:49:28.000Z"
+        }
+      }
+    ]
   }
 }
 ```
+
+When the call ends, the agent posts an additional webhook to `N8N_WEBHOOK_URL` with a usage summary, per-turn metrics, session start/end timestamps, duration, and the resolved session configuration. Use this payload to drive follow-up automation or analytics inside n8n.
 
 Store these identifiers in n8n if you need to reconcile the LiveKit call later (e.g., writing to a CRM or support ticket).
 

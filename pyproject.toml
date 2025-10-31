@@ -13,6 +13,9 @@ dependencies = [
     "livekit-agents[silero,turn-detector]~=1.2",
     "livekit-plugins-cartesia>=1.2.15",
     "livekit-plugins-noise-cancellation~=0.2",
+    "httpx>=0.27.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.23.0",
+    "opentelemetry-sdk>=1.23.0",
     "python-dotenv",
     "uvicorn>=0.38.0",
 ]
